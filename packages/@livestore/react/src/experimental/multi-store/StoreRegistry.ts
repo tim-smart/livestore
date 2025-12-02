@@ -1,13 +1,25 @@
+import type { UnknownError } from '@livestore/common'
 import type { LiveStoreSchema } from '@livestore/common/schema'
-import { createStorePromise, type Store, type Unsubscribe } from '@livestore/livestore'
+import { createStore, createStorePromise, type Store, type Unsubscribe } from '@livestore/livestore'
+import { Effect, type Fiber, type OtelTracer, Scope, Subscribable } from '@livestore/utils/effect'
 import type { CachedStoreOptions, StoreId } from './types.ts'
 
+// TODO: change status to _tag
 type StoreEntryState<TSchema extends LiveStoreSchema> =
   | { status: 'idle' }
-  | { status: 'loading'; promise: Promise<Store<TSchema>>; abortController: AbortController }
-  | { status: 'success'; store: Store<TSchema> }
-  | { status: 'error'; error: unknown }
-  | { status: 'shutting_down'; shutdownPromise: Promise<void> }
+  | {
+      status: 'loading'
+      fiber: Fiber.Fiber<Store<TSchema>, UnknownError>
+      scope: Scope.CloseableScope
+      rc: number
+    }
+  | { status: 'loaded'; store: Store<TSchema>; scope: Scope.CloseableScope; rc: number }
+  | { status: 'error'; error: unknown; scope: Scope.CloseableScope; rc: number }
+  | { status: 'shutting_down'; shutdownFiber: Fiber.Fiber<void>; scope: Scope.CloseableScope; rc: number }
+
+type StatusState = {
+  _
+}
 
 /**
  * Default time to keep unused stores in cache.
@@ -80,16 +92,16 @@ class StoreEntry<TSchema extends LiveStoreSchema = LiveStoreSchema> {
    * Transitions to the loading state.
    */
   #setLoading(promise: Promise<Store<TSchema>>, abortController: AbortController): void {
-    if (this.#state.status === 'success' || this.#state.status === 'loading') return
+    if (this.#state.status === 'loaded' || this.#state.status === 'loading') return
     this.#state = { status: 'loading', promise, abortController }
     this.#notify()
   }
 
   /**
-   * Transitions to the success state.
+   * Transitions to the loaded state.
    */
   #setStore = (store: Store<TSchema>): void => {
-    this.#state = { status: 'success', store }
+    this.#state = { status: 'loaded', store }
     this.#notify()
   }
 
@@ -105,7 +117,7 @@ class StoreEntry<TSchema extends LiveStoreSchema = LiveStoreSchema> {
    * Transitions to the shutting_down state.
    */
   #setShuttingDown = (shutdownPromise: Promise<void>): void => {
-    this.#state = { status: 'shutting_down', shutdownPromise }
+    this.#state = { status: 'shutting_down', shutdownFiber: shutdownPromise }
     this.#notify()
   }
 
@@ -149,6 +161,8 @@ class StoreEntry<TSchema extends LiveStoreSchema = LiveStoreSchema> {
     }
   }
 
+  // subscribeStream = (): Stream.Stream => {}
+
   /**
    * Gets the loaded store or initiates loading if not already in progress.
    *
@@ -159,20 +173,51 @@ class StoreEntry<TSchema extends LiveStoreSchema = LiveStoreSchema> {
    * This method handles the complete lifecycle of loading a store:
    * - Returns the store directly if already loaded (synchronous)
    * - Returns a Promise if loading is in progress or needs to be initiated
-   * - Transitions through loading → success/error states
+   * - Transitions through loading → loaded/error states
+   * - Schedules disposal when loading completes without active subscribers
+   */
+  getOrLoadEffect = (
+    options: CachedStoreOptions<TSchema>,
+  ): Effect.Effect<Store<TSchema>, UnknownError, Scope.Scope | OtelTracer.OtelTracer> =>
+    Effect.gen(this, function* () {
+      yield* Effect.addFinalizer(() => Effect.gen(this, function* () {}))
+      if (this.#state.status === 'idle') {
+        const scope = yield* Scope.make()
+        const fiber = yield* createStore(options).pipe(Scope.extend(scope), Effect.forkScoped)
+        this.#state = { status: 'loading', scope, fiber, rc: 1 }
+        return yield* fiber
+      }
+
+      // TODO: use Semaphore for all getOrLoadEffect calls
+      return yield* createStore(options)
+    })
+
+  status: Effect = Effect.gen(this, function* () {})
+
+  /**
+   * Gets the loaded store or initiates loading if not already in progress.
+   *
+   * @param options - Store creation options
+   * @returns The loaded store if available, or a Promise that resolves to the loaded store
+   *
+   * @remarks
+   * This method handles the complete lifecycle of loading a store:
+   * - Returns the store directly if already loaded (synchronous)
+   * - Returns a Promise if loading is in progress or needs to be initiated
+   * - Transitions through loading → loaded/error states
    * - Schedules disposal when loading completes without active subscribers
    */
   getOrLoad = (options: CachedStoreOptions<TSchema>): Store<TSchema> | Promise<Store<TSchema>> => {
     if (options.unusedCacheTime !== undefined)
       this.#unusedCacheTime = Math.max(this.#unusedCacheTime ?? 0, options.unusedCacheTime)
 
-    if (this.#state.status === 'success') return this.#state.store
-    if (this.#state.status === 'loading') return this.#state.promise
+    if (this.#state.status === 'loaded') return this.#state.store
+    if (this.#state.status === 'loading') return this.#state.fiber
     if (this.#state.status === 'error') throw this.#state.error
 
     // Wait for shutdown to complete, then recursively call to load a fresh store
     if (this.#state.status === 'shutting_down') {
-      return this.#state.shutdownPromise.then(() => this.getOrLoad(options))
+      return this.#state.shutdownFiber.then(() => this.getOrLoad(options))
     }
 
     const abortController = new AbortController()
@@ -208,7 +253,7 @@ class StoreEntry<TSchema extends LiveStoreSchema = LiveStoreSchema> {
   }
 
   #shutdown = async (): Promise<void> => {
-    if (this.#state.status !== 'success') return
+    if (this.#state.status !== 'loaded') return
     await this.#state.store.shutdownPromise().catch((reason) => {
       console.warn(`Store ${this.#storeId} failed to shutdown cleanly during disposal:`, reason)
     })
@@ -276,10 +321,6 @@ type DefaultStoreOptions = Partial<
   unusedCacheTime?: number
 }
 
-type StoreRegistryConfig = {
-  defaultOptions?: DefaultStoreOptions
-}
-
 /**
  * Store Registry coordinating store loading, caching, and subscription
  *
@@ -287,18 +328,6 @@ type StoreRegistryConfig = {
  */
 export class StoreRegistry {
   readonly #cache = new StoreCache()
-  readonly #defaultOptions: DefaultStoreOptions
-
-  constructor({ defaultOptions = {} }: StoreRegistryConfig = {}) {
-    this.#defaultOptions = defaultOptions
-  }
-
-  #applyDefaultOptions = <TSchema extends LiveStoreSchema>(
-    options: CachedStoreOptions<TSchema>,
-  ): CachedStoreOptions<TSchema> => ({
-    ...this.#defaultOptions,
-    ...options,
-  })
 
   /**
    * Get or load a store, returning it directly if loaded or a promise if loading.
@@ -312,31 +341,31 @@ export class StoreRegistry {
    * - Returns a stable Promise reference when loading is in progress or needs to be initiated
    * - Applies default options from registry config, with call-site options taking precedence
    */
-  getOrLoad = <TSchema extends LiveStoreSchema>(
-    options: CachedStoreOptions<TSchema>,
-  ): Store<TSchema> | Promise<Store<TSchema>> => {
-    const optionsWithDefaults = this.#applyDefaultOptions(options)
-    const storeEntry = this.#cache.ensure<TSchema>(optionsWithDefaults.storeId)
+  getOrLoad = <TSchema extends LiveStoreSchema>(options: CachedStoreOptions<TSchema>): Effect.Effect<Store<TSchema>> =>
+    Effect.gen(this, function* () {
+      const storeEntry = this.#cache.ensure<TSchema>(options.storeId)
 
-    return storeEntry.getOrLoad(optionsWithDefaults)
-  }
+      return storeEntry.getOrLoad(options)
+    })
 
   /**
-   * Warms the cache for a store without mounting a subscriber.
+   * Get or load a store, returning it directly if loaded or a promise if loading.
    *
-   * @typeParam TSchema - The schema of the store to preload
-   * @returns A promise that resolves when the loading is complete (success or failure)
+   * @typeParam TSchema - The schema of the store to load
+   * @returns The loaded store if available, or a Promise that resolves to the loaded store
+   * @throws unknown loading error
    *
    * @remarks
-   * - We don't return the store or throw as this is a fire-and-forget operation.
-   * - If the entry remains unused after preload resolves/rejects, it is scheduled for disposal.
+   * - Returns the store instance directly (synchronous) when already loaded
+   * - Returns a stable Promise reference when loading is in progress or needs to be initiated
+   * - Applies default options from registry config, with call-site options taking precedence
    */
-  preload = async <TSchema extends LiveStoreSchema>(options: CachedStoreOptions<TSchema>): Promise<void> => {
-    try {
-      await this.getOrLoad(options)
-    } catch {
-      // Do nothing; preload is best-effort
-    }
+  getOrLoadPromise = <TSchema extends LiveStoreSchema>(
+    options: CachedStoreOptions<TSchema>,
+  ): Store<TSchema> | Promise<Store<TSchema>> => {
+    const storeEntry = this.#cache.ensure<TSchema>(options.storeId)
+
+    return storeEntry.getOrLoad(options)
   }
 
   subscribe = <TSchema extends LiveStoreSchema>(storeId: StoreId, listener: () => void): Unsubscribe => {

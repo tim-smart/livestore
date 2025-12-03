@@ -174,17 +174,35 @@ export class StoreRegistry {
      * logically identical options as the same cache key even when callers pass fresh
      * object literals.
      */
-    const canonical = Data.struct(options) as CachedStoreOptions<TSchema>
+    const newValue = Data.struct(options) as CachedStoreOptions<TSchema>
     const existing = this.#optionsByStoreId.get(options.storeId) as CachedStoreOptions<TSchema> | undefined
 
     if (existing) {
-      if (!Equal.equals(existing, canonical)) {
-        return shouldNeverHappen(`StoreRegistry received changed options for storeId ${options.storeId}`)
+      const ignoreKeys = ['boot']
+      const warningKeys = ['signal']
+      const errorKeys = ['schema', 'adapter']
+
+      for (const key of Object.keys(existing) as (keyof CachedStoreOptions<TSchema>)[]) {
+        if (ignoreKeys.includes(key)) continue
+        if (warningKeys.includes(key) && existing[key] !== newValue[key]) {
+          console.warn(`StoreRegistry received changed options for storeId ${options.storeId}`, {
+            existingValue: existing[key],
+            newValue: newValue[key],
+          })
+          continue
+        }
+        if (errorKeys.includes(key) && existing[key] !== newValue[key]) {
+          return shouldNeverHappen(`StoreRegistry received changed options for storeId ${options.storeId}`, {
+            existingValue: existing[key],
+            newValue: newValue[key],
+          })
+        }
       }
+
       return existing
     }
 
-    this.#optionsByStoreId.set(options.storeId, canonical)
-    return canonical
+    this.#optionsByStoreId.set(options.storeId, newValue)
+    return newValue
   }
 }

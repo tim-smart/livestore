@@ -16,19 +16,60 @@ export const useStore = <TSchema extends LiveStoreSchema>(
 ): Store<TSchema> & ReactApi => {
   const storeRegistry = useStoreRegistry()
 
-  const subscribe = React.useCallback(
-    (onChange: () => void) => storeRegistry.subscribe(options, onChange),
+  /** Keep the store retained while this hook is mounted; shutdown runs when unsubscribed. */
+  React.useEffect(() => storeRegistry.retain(options), [storeRegistry, options])
+
+  /** Promise is stable per options and drives Suspense via React.use. */
+  const storeThenable = React.useMemo(
+    () => tagThenableStatus(storeRegistry.getOrLoadStore(options)),
     [storeRegistry, options],
   )
-  const getSnapshot = React.useCallback(() => {
-    const storeOrPromise = storeRegistry.getOrLoadPromise(options)
 
-    if (storeOrPromise instanceof Promise) throw storeOrPromise
+  /** Suspends on first read; status-tagged promise lets React reuse the settled value or error on rerenders. */
+  const store = React.use(storeThenable)
 
-    return storeOrPromise
-  }, [storeRegistry, options])
-
-  const loadedStore = React.useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
-
-  return withReactApi(loadedStore)
+  return withReactApi(store)
 }
+
+const tagThenableStatus = <T>(
+  resource: Promise<T> | T,
+): Promise<T> & {
+  status?: 'pending' | 'fulfilled' | 'rejected'
+  value?: T
+  reason?: unknown
+} => {
+  /**
+   * React caches promise status on the thenable itself. We mirror that shape:
+   * - If already tagged, reuse it (preserves React's cached status)
+   * - Otherwise tag on settle so React.use can reuse the fulfilled/rejected value
+   */
+  const thenable = (isPromiseLike(resource) ? resource : Promise.resolve(resource)) as Promise<T> & {
+    status?: 'pending' | 'fulfilled' | 'rejected'
+    value?: T
+    reason?: unknown
+  }
+
+  if (thenable.status !== undefined) return thenable
+
+  if (!isPromiseLike(resource)) {
+    thenable.status = 'fulfilled'
+    thenable.value = resource as T
+    return thenable
+  }
+
+  thenable.then(
+    (value) => {
+      thenable.status = 'fulfilled'
+      thenable.value = value
+    },
+    (reason) => {
+      thenable.status = 'rejected'
+      thenable.reason = reason
+    },
+  )
+
+  return thenable
+}
+
+const isPromiseLike = (value: unknown): value is Promise<unknown> =>
+  typeof value === 'object' && value !== null && 'then' in value

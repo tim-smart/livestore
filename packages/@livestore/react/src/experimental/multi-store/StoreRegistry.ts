@@ -1,49 +1,20 @@
 import type { UnknownError } from '@livestore/common'
 import { OtelLiveDummy } from '@livestore/common'
 import type { LiveStoreSchema } from '@livestore/common/schema'
-import { createStore, createStorePromise, type Store, type Unsubscribe } from '@livestore/livestore'
+import { createStore, type Store, type Unsubscribe } from '@livestore/livestore'
+import { shouldNeverHappen } from '@livestore/utils'
 import {
+  Data,
   Effect,
-  type Fiber,
+  Equal,
   Layer,
   ManagedRuntime,
   type OtelTracer,
   RcMap,
-  RcRef,
   type Runtime,
   type Scope,
-  Subscribable,
 } from '@livestore/utils/effect'
 import type { CachedStoreOptions, StoreId } from './types.ts'
-
-// TODO: change status to _tag
-// type StoreEntryState<TSchema extends LiveStoreSchema> =
-//   | { status: 'idle' }
-//   | {
-//       status: 'loading'
-//       // fiber: Fiber.Fiber<Store<TSchema>, UnknownError>
-//       // scope: Scope.CloseableScope
-//       // rc: number
-//     }
-//   | {
-//       status: 'loaded'
-//       store: Store<TSchema>
-//       scope: Scope.CloseableScope
-//       shutdownCallbacks: () => void
-//       rc: number
-//     }
-//   | {
-//       status: 'error'
-//       error: unknown
-//       scope: Scope.CloseableScope
-//       rc: number
-//     }
-//   | {
-//       status: 'shutting_down'
-//       shutdownFiber: Fiber.Fiber<void>
-//       scope: Scope.CloseableScope
-//       rc: number
-//     }
 
 /**
  * Default time to keep unused stores in cache.
@@ -54,88 +25,6 @@ import type { CachedStoreOptions, StoreId } from './types.ts'
  * @internal Exported primarily for testing purposes.
  */
 export const DEFAULT_UNUSED_CACHE_TIME = typeof window === 'undefined' ? Number.POSITIVE_INFINITY : 60_000
-
-/**
- * @typeParam TSchema - The schema for this entry's store.
- * @internal
- */
-// class StoreEntry<TSchema extends LiveStoreSchema = LiveStoreSchema> {
-//   readonly #storeId: StoreId
-//   // readonly #cache: StoreCache
-
-//   #state: StoreEntryState<TSchema> = { status: 'idle' }
-
-//   #rcRef: RcRef.RcRef<Store<TSchema>, UnknownError>
-
-//   #unusedCacheTime?: number
-//   // #disposalTimeout?: ReturnType<typeof setTimeout> | null
-
-//   /**
-//    * Set of subscriber callbacks to notify on state changes.
-//    */
-//   readonly #subscribers = new Set<() => void>()
-
-//   constructor(
-//     storeId: StoreId,
-//     options: CachedStoreOptions<TSchema>,
-//     runtime: Runtime.Runtime<Scope.Scope | OtelTracer.OtelTracer>,
-//   ) {
-//     this.#storeId = storeId
-//     this.#rcRef = RcRef.make({
-//       acquire: Effect.gen(this, function* () {
-//         this.#state = { status: 'loading' }
-//         return yield* createStore(options).pipe(
-//           Effect.acquireRelease(() =>
-//             Effect.gen(this, function* () {
-//               for (const sub of this.#subscribers) {
-//                 sub()
-//               }
-//             }),
-//           ),
-//         )
-//       }),
-//     }).pipe(Effect.provide(runtime), Effect.runSync)
-//     // this.#cache = cache
-//   }
-
-//   /**
-//    * Gets the loaded store or initiates loading if not already in progress.
-//    *
-//    * @param options - Store creation options
-//    * @returns The loaded store if available, or a Promise that resolves to the loaded store
-//    *
-//    * @remarks
-//    * This method handles the complete lifecycle of loading a store:
-//    * - Returns the store directly if already loaded (synchronous)
-//    * - Returns a Promise if loading is in progress or needs to be initiated
-//    * - Transitions through loading → loaded/error states
-//    * - Schedules disposal when loading completes without active subscribers
-//    */
-//   getOrLoad = (
-//     options: CachedStoreOptions<TSchema>,
-//     // todo: don't use a scope in this fn
-//   ): Effect.Effect<Store<TSchema>, UnknownError, Scope.Scope | OtelTracer.OtelTracer> =>
-//     Effect.gen(this, function* () {
-//       // TODO: use Semaphore for all getOrLoadEffect calls
-//       return yield* createStore(options)
-//     })
-
-//   use = (
-//     options: CachedStoreOptions<TSchema>,
-//     onShutdown: () => void,
-//   ): Effect.Effect<Store<TSchema>, UnknownError, Scope.Scope> =>
-//     Effect.gen(this, function* () {
-//       // if (this.#state.status === 'idle') {
-//       //   const scope = yield* Scope.make()
-//       //   const fiber = yield* createStore(options).pipe(Scope.extend(scope), Effect.forkScoped)
-//       //   // todo trigger subscribe here with unused-value timeout to later simulate the cleanup
-//       //   this.#state = { status: 'loading', scope, fiber, rc: 1 }
-//       //   return yield* fiber
-//       // }
-
-//       return yield* this.#rcRef.get
-//     })
-// }
 
 type DefaultStoreOptions = Partial<
   Pick<
@@ -170,16 +59,14 @@ type DefaultStoreOptions = Partial<
  * @public
  */
 export class StoreRegistry {
-  #rcMap: RcMap.RcMap<
-    CachedStoreOptions<any>,
-    {
-      store: Store<LiveStoreSchema>
-      /** Set of subscriber callbacks to notify when the store is shut down. */
-      onShutdown: Set<() => void>
-    },
-    UnknownError
-  >
+  /** RcMap tracks store lifetimes keyed by canonical options. */
+  #rcMap: RcMap.RcMap<CachedStoreOptions<any>, Store<any>, UnknownError>
+  /** Effect runtime to run with current scope and otel tracer. If the scope is closed, all stores will be shut down automatically. */
   #runtime: Runtime.Runtime<Scope.Scope | OtelTracer.OtelTracer>
+  /** Canonicalized options per storeId to provide stable RcMap keys. */
+  #optionsByStoreId = new Map<StoreId, CachedStoreOptions<any>>()
+  /** Handles promise/result caching per storeId to keep RcMap focused on lifecycle. */
+  #promiseCache = new StorePromiseCache()
 
   constructor(defaultOptions?: DefaultStoreOptions) {
     this.#runtime =
@@ -196,72 +83,147 @@ export class StoreRegistry {
             idleTimeToLiveRef.current = options.unusedCacheTime
           }
 
-          const onShutdown = new Set<() => void>()
           const store = yield* createStore(options).pipe(
             Effect.acquireRelease(() =>
               Effect.gen(this, function* () {
-                for (const sub of onShutdown) {
-                  sub()
-                }
+                this.#promiseCache.delete(options.storeId)
+                this.#optionsByStoreId.delete(options.storeId)
               }),
             ),
           )
-          return { store, onShutdown }
-        }),
+          return store
+        }).pipe(Effect.withSpan(`StoreRegistry.lookup:${options.storeId}`)),
       idleTimeToLive: idleTimeToLiveRef.current,
     }).pipe(Effect.provide(this.#runtime), Effect.runSync)
   }
 
   /**
-   * Get or load a store, returning it directly if loaded or a promise if loading.
-   *
-   * @typeParam TSchema - The schema of the store to load
-   * @returns The loaded store if available, or a Promise that resolves to the loaded store
-   * @throws unknown loading error
-   *
-   * @remarks
-   * - Returns the store instance directly (synchronous) when already loaded
-   * - Returns a stable Promise reference when loading is in progress or needs to be initiated
-   * - Applies default options from registry config, with call-site options taking precedence
+   * Effectful entrypoint to get or load a store via RcMap (one instance per storeId).
+   * Keeps lifecycle tied to the current runtime/scope.
    */
   getOrLoad = <TSchema extends LiveStoreSchema>(
     options: CachedStoreOptions<TSchema>,
   ): Effect.Effect<Store<TSchema>, UnknownError, Scope.Scope> =>
     Effect.gen(this, function* () {
-      const storeEntry = yield* RcMap.get(this.#rcMap, options)
+      const cacheKey = this.#getCacheKey(options)
+      const storeEntry = yield* RcMap.get(this.#rcMap, cacheKey)
 
-      return storeEntry.store as unknown as Store<TSchema>
-    })
+      return storeEntry as unknown as Store<TSchema>
+    }).pipe(Effect.withSpan(`StoreRegistry.getOrLoad:${options.storeId}`))
 
   /**
-   * Get or load a store, returning it directly if loaded or a promise if loading.
+   * Get or load a store (React-friendly): returns a settled store synchronously or the in-flight Promise.
    *
    * @typeParam TSchema - The schema of the store to load
-   * @returns The loaded store if available, or a Promise that resolves to the loaded store
+   * @returns The loaded store synchronously if already settled; otherwise the in-flight Promise
    * @throws unknown loading error
    *
    * @remarks
-   * - Returns the store instance directly (synchronous) when already loaded
+   * - Returns the store instance directly (synchronous) when already settled (fulfilled or rejected)
    * - Returns a stable Promise reference when loading is in progress or needs to be initiated
    * - Applies default options from registry config, with call-site options taking precedence
    */
-  getOrLoadPromise = <TSchema extends LiveStoreSchema>(options: CachedStoreOptions<TSchema>): Promise<Store<TSchema>> =>
-    this.getOrLoad<TSchema>(options).pipe(Effect.provide(this.#runtime), Effect.runPromise)
+  getOrLoadStore = <TSchema extends LiveStoreSchema>(
+    options: CachedStoreOptions<TSchema>,
+  ): Store<TSchema> | Promise<Store<TSchema>> => {
+    const cacheKey = this.#getCacheKey(options)
+    const cachedResult = this.#promiseCache.getResult<TSchema>(cacheKey.storeId)
 
-  subscribe = (options: CachedStoreOptions<any>, listener: () => void): Unsubscribe => {
+    if (cachedResult?.status === 'fulfilled') return cachedResult.value
+    if (cachedResult?.status === 'rejected') throw cachedResult.reason
+
+    return this.#promiseCache.getOrLoad(cacheKey, (opts) =>
+      this.getOrLoad<TSchema>(opts).pipe(Effect.provide(this.#runtime), Effect.runPromise),
+    )
+  }
+
+  /** Retain the store while mounted; caller releases via the returned unsubscribe. */
+  retain = (options: CachedStoreOptions<any>): Unsubscribe => {
     const unsubscribe = Effect.gen(this, function* () {
-      const entry = yield* RcMap.get(this.#rcMap, options)
-
-      entry.onShutdown.add(listener)
-
-      return yield* Effect.never
+      const cacheKey = this.#getCacheKey(options)
+      yield* RcMap.get(this.#rcMap, cacheKey)
+      yield* Effect.never
     }).pipe(Effect.provide(this.#runtime), Effect.runCallback)
 
     return () => unsubscribe()
   }
 
+  /** Fire-and-forget warmup; swallows errors but keeps them cached for later reuse. */
   preload = (options: CachedStoreOptions<any>): Promise<void> =>
-    this.getOrLoadPromise(options)
-      .then(() => undefined)
-      .catch(() => undefined)
+    Promise.resolve(this.getOrLoadStore(options)).then(
+      () => undefined,
+      () => undefined,
+    )
+
+  /** Canonicalize caller options for RcMap keying and memoized promise cache. */
+  #getCacheKey = <TSchema extends LiveStoreSchema>(options: CachedStoreOptions<TSchema>): CachedStoreOptions<TSchema> => {
+    /**
+     * Data.struct keeps a stable structural instance per storeId so RcMap can treat
+     * logically identical options as the same cache key even when callers pass fresh
+     * object literals.
+     */
+    const canonical = Data.struct(options) as CachedStoreOptions<TSchema>
+    const existing = this.#optionsByStoreId.get(options.storeId) as CachedStoreOptions<TSchema> | undefined
+
+    if (existing) {
+      if (!Equal.equals(existing, canonical)) {
+        return shouldNeverHappen(`StoreRegistry received changed options for storeId ${options.storeId}`)
+      }
+      return existing
+    }
+
+    this.#optionsByStoreId.set(options.storeId, canonical)
+    return canonical
+  }
+}
+
+type StoreResult<TSchema extends LiveStoreSchema> =
+  | { status: 'fulfilled'; value: Store<TSchema> }
+  | { status: 'rejected'; reason: unknown }
+
+/**
+ * Lightweight cache to keep one in-flight/settled promise per storeId and expose
+ * settled results for React suspense reuse without entangling StoreRegistry with
+ * promise status tagging.
+ */
+class StorePromiseCache {
+  /** In-flight or settled promises per storeId. */
+  #storePromises = new Map<StoreId, Promise<Store<any>>>()
+  /** Tracks settled results so React can reuse status synchronously in useStore. */
+  #storeResults = new Map<StoreId, StoreResult<any>>()
+
+  getOrLoad = <TSchema extends LiveStoreSchema>(
+    options: CachedStoreOptions<TSchema>,
+    loader: (opts: CachedStoreOptions<TSchema>) => Promise<Store<TSchema>>,
+  ): Promise<Store<TSchema>> => {
+    /** Only one promise per storeId; reuse across callers to avoid duplicate loads. */
+    const existing = this.#storePromises.get(options.storeId) as Promise<Store<TSchema>> | undefined
+    if (existing) return existing
+
+    /**
+     * Capture settled result so React.use can reuse fulfilled/rejected values
+     * without re-awaiting (status tagging happens in useStore).
+     */
+    const promise = loader(options).then(
+      (value) => {
+        this.#storeResults.set(options.storeId, { status: 'fulfilled', value })
+        return value
+      },
+      (reason) => {
+        this.#storeResults.set(options.storeId, { status: 'rejected', reason })
+        throw reason
+      },
+    )
+
+    this.#storePromises.set(options.storeId, promise)
+    return promise
+  }
+
+  getResult = <TSchema extends LiveStoreSchema>(storeId: StoreId): StoreResult<TSchema> | undefined =>
+    this.#storeResults.get(storeId) as StoreResult<TSchema> | undefined
+
+  delete = (storeId: StoreId): void => {
+    this.#storePromises.delete(storeId)
+    this.#storeResults.delete(storeId)
+  }
 }

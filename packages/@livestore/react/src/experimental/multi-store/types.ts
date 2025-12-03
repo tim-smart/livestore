@@ -24,6 +24,7 @@ export type StoreDescriptor<TSchema extends LiveStoreSchema> = {
   readonly storeId: StoreId
 }
 
+// TODO jsdoc
 export type CachedStoreOptions<
   TSchema extends LiveStoreSchema = LiveStoreSchema.Any,
   TContext = {},

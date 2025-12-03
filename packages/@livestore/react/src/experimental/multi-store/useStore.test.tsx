@@ -75,7 +75,7 @@ describe('experimental useStore', () => {
     })
 
     // Pre-load the store to cache the error
-    await expect(registry.getOrLoad(badOptions)).rejects.toThrow()
+    await expect(registry.getOrLoadPromise(badOptions)).rejects.toThrow()
 
     // Now when useStore tries to get it, it should throw synchronously
     expect(() =>

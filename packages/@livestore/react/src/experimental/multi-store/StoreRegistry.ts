@@ -68,7 +68,7 @@ export class StoreRegistry {
   /** Handles promise/result caching per storeId to keep RcMap focused on lifecycle. */
   #promiseCache = new StorePromiseCache()
 
-  constructor(defaultOptions?: DefaultStoreOptions) {
+  constructor({ defaultOptions }: { defaultOptions?: DefaultStoreOptions } = {}) {
     this.#runtime =
       defaultOptions?.runtime ??
       ManagedRuntime.make(Layer.mergeAll(Layer.scope, OtelLiveDummy)).runtimeEffect.pipe(Effect.runSync)
@@ -156,7 +156,9 @@ export class StoreRegistry {
     )
 
   /** Canonicalize caller options for RcMap keying and memoized promise cache. */
-  #getCacheKey = <TSchema extends LiveStoreSchema>(options: CachedStoreOptions<TSchema>): CachedStoreOptions<TSchema> => {
+  #getCacheKey = <TSchema extends LiveStoreSchema>(
+    options: CachedStoreOptions<TSchema>,
+  ): CachedStoreOptions<TSchema> => {
     /**
      * Data.struct keeps a stable structural instance per storeId so RcMap can treat
      * logically identical options as the same cache key even when callers pass fresh

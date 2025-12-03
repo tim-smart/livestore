@@ -1,7 +1,8 @@
 import { makeInMemoryAdapter } from '@livestore/adapter-web'
 import type { Store } from '@livestore/livestore'
 import { StoreInternalsSymbol } from '@livestore/livestore'
-import { type RenderResult, render, renderHook, waitFor } from '@testing-library/react'
+import { shouldNeverHappen } from '@livestore/utils'
+import { act, type RenderHookResult, type RenderResult, render, renderHook, waitFor } from '@testing-library/react'
 import * as React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { schema } from '../../__tests__/fixture.tsx'
@@ -21,22 +22,27 @@ describe('experimental useStore', () => {
     const registry = new StoreRegistry()
     const options = testStoreOptions()
 
-    const view = render(
-      <StoreRegistryProvider storeRegistry={registry}>
-        <React.Suspense fallback={<div data-testid="fallback" />}>
-          <StoreConsumer options={options} />
-        </React.Suspense>
-      </StoreRegistryProvider>,
-    )
+    let view: RenderResult | undefined
+    await act(async () => {
+      view = render(
+        <StoreRegistryProvider storeRegistry={registry}>
+          <React.Suspense fallback={<div data-testid="fallback" />}>
+            <StoreConsumer options={options} />
+          </React.Suspense>
+        </StoreRegistryProvider>,
+      )
+    })
+    const renderedView = view ?? shouldNeverHappen('render failed')
 
     // Should show fallback while loading
-    expect(view.getByTestId('fallback')).toBeDefined()
+    expect(renderedView.getByTestId('fallback')).toBeDefined()
 
     // Wait for store to load and component to render
-    await waitForSuspenseResolved(view)
-    expect(view.getByTestId('ready')).toBeDefined()
+    await waitForSuspenseResolved(renderedView)
 
-    cleanupWithPendingTimers(() => view.unmount())
+    expect(renderedView.getByTestId('ready')).toBeDefined()
+
+    cleanupWithPendingTimers(() => renderedView.unmount())
   })
 
   it('does not re-suspend on subsequent renders when store is already loaded', async () => {
@@ -51,20 +57,26 @@ describe('experimental useStore', () => {
       </StoreRegistryProvider>
     )
 
-    const view = render(<Wrapper opts={options} />)
+    let view: RenderResult | undefined
+    await act(async () => {
+      view = render(<Wrapper opts={options} />)
+    })
+    const renderedView = view ?? shouldNeverHappen('render failed')
 
     // Wait for initial load
-    await waitForSuspenseResolved(view)
-    expect(view.getByTestId('ready')).toBeDefined()
+    await waitForSuspenseResolved(renderedView)
+    expect(renderedView.getByTestId('ready')).toBeDefined()
 
     // Rerender with new options object (but same storeId)
-    view.rerender(<Wrapper opts={{ ...options }} />)
+    await act(async () => {
+      renderedView.rerender(<Wrapper opts={{ ...options }} />)
+    })
 
     // Should not show fallback
-    expect(view.queryByTestId('fallback')).toBeNull()
-    expect(view.getByTestId('ready')).toBeDefined()
+    expect(renderedView.queryByTestId('fallback')).toBeNull()
+    expect(renderedView.getByTestId('ready')).toBeDefined()
 
-    cleanupWithPendingTimers(() => view.unmount())
+    cleanupWithPendingTimers(() => renderedView.unmount())
   })
 
   it('throws when store loading fails', async () => {
@@ -75,7 +87,7 @@ describe('experimental useStore', () => {
     })
 
     // Pre-load the store to cache the error
-    await expect(registry.getOrLoadPromise(badOptions)).rejects.toThrow()
+    await expect(registry.getOrLoadStore(badOptions)).rejects.toThrow()
 
     // Now when useStore tries to get it, it should throw synchronously
     expect(() =>
@@ -92,10 +104,14 @@ describe('experimental useStore', () => {
     const registry = new StoreRegistry()
     const options = testStoreOptions()
 
-    const { result, unmount } = renderHook(() => useStore(options), {
-      wrapper: makeProvider(registry, { suspense: true }),
-      reactStrictMode: strictMode,
+    let hook: RenderHookResult<Store<typeof schema>, CachedStoreOptions<typeof schema>> | undefined
+    await act(async () => {
+      hook = renderHook(() => useStore(options), {
+        wrapper: makeProvider(registry, { suspense: true }),
+        reactStrictMode: strictMode,
+      })
     })
+    const { result, unmount } = hook ?? shouldNeverHappen('renderHook failed')
 
     // Wait for store to be ready
     await waitForStoreReady(result)
@@ -110,10 +126,14 @@ describe('experimental useStore', () => {
     const optionsA = testStoreOptions({ storeId: 'store-a' })
     const optionsB = testStoreOptions({ storeId: 'store-b' })
 
-    const { result, rerender, unmount } = renderHook((opts) => useStore(opts), {
-      initialProps: optionsA,
-      wrapper: makeProvider(registry, { suspense: true }),
+    let hook: RenderHookResult<Store<typeof schema>, CachedStoreOptions<typeof schema>> | undefined
+    await act(async () => {
+      hook = renderHook((opts) => useStore(opts), {
+        initialProps: optionsA,
+        wrapper: makeProvider(registry, { suspense: true }),
+      })
     })
+    const { result, rerender, unmount } = hook ?? shouldNeverHappen('renderHook failed')
 
     // Wait for first store to load
     await waitForStoreReady(result)
@@ -121,7 +141,9 @@ describe('experimental useStore', () => {
     expect(storeA[StoreInternalsSymbol].clientSession).toBeDefined()
 
     // Switch to different storeId
-    rerender(optionsB)
+    await act(async () => {
+      rerender(optionsB)
+    })
 
     // Wait for second store to load and verify it's different from the first
     await waitFor(() => {
@@ -154,9 +176,11 @@ const makeProvider =
     return content
   }
 
+let testStoreCounter = 0
+
 const testStoreOptions = (overrides: Partial<CachedStoreOptions<typeof schema>> = {}) =>
   storeOptions({
-    storeId: 'test-store',
+    storeId: overrides.storeId ?? `test-store-${testStoreCounter++}`,
     schema,
     adapter: makeInMemoryAdapter(),
     ...overrides,

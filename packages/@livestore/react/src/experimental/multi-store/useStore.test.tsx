@@ -86,8 +86,8 @@ describe('experimental useStore', () => {
       adapter: null,
     })
 
-    // Pre-load the store to cache the error
-    await expect(registry.getOrLoadStore(badOptions)).rejects.toThrow()
+    // Pre-load the store to cache the error (error happens synchronously)
+    expect(() => registry.getOrLoadStore(badOptions)).toThrow()
 
     // Now when useStore tries to get it, it should throw synchronously
     expect(() =>

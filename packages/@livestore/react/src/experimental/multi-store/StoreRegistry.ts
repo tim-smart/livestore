@@ -1,17 +1,19 @@
-import type { UnknownError } from '@livestore/common'
-import { OtelLiveDummy } from '@livestore/common'
+import { OtelLiveDummy, UnknownError } from '@livestore/common'
 import type { LiveStoreSchema } from '@livestore/common/schema'
 import { createStore, type Store, type Unsubscribe } from '@livestore/livestore'
 import { shouldNeverHappen } from '@livestore/utils'
 import {
+  Cause,
   Data,
   Effect,
   Equal,
+  Exit,
+  Fiber,
   Layer,
   ManagedRuntime,
   type OtelTracer,
   RcMap,
-  type Runtime,
+  Runtime,
   type Scope,
 } from '@livestore/utils/effect'
 import type { CachedStoreOptions, StoreId } from './types.ts'
@@ -63,10 +65,8 @@ export class StoreRegistry {
   #rcMap: RcMap.RcMap<CachedStoreOptions<any>, Store<any>, UnknownError>
   /** Effect runtime to run with current scope and otel tracer. If the scope is closed, all stores will be shut down automatically. */
   #runtime: Runtime.Runtime<Scope.Scope | OtelTracer.OtelTracer>
-  /** Canonicalized options per storeId to provide stable RcMap keys. */
+  /** Canonicalized options per storeId to provide stable RcMap keys. Used for improved error messages when user passes different options to the same store. */
   #optionsByStoreId = new Map<StoreId, CachedStoreOptions<any>>()
-  /** Handles promise/result caching per storeId to keep RcMap focused on lifecycle. */
-  #promiseCache = new StorePromiseCache()
 
   constructor({ defaultOptions }: { defaultOptions?: DefaultStoreOptions } = {}) {
     this.#runtime =
@@ -74,6 +74,8 @@ export class StoreRegistry {
       ManagedRuntime.make(Layer.mergeAll(Layer.scope, OtelLiveDummy)).runtimeEffect.pipe(Effect.runSync)
 
     /** We're overriding the idleTimeToLive value with the most recent value passed to the registry. */
+    // TODO this is actually not yet working since Effect doesn't yet support dynamic runtime values for RcMap
+    // https://github.com/Effect-TS/effect/pull/5859
     const idleTimeToLiveRef = { current: defaultOptions?.unusedCacheTime ?? DEFAULT_UNUSED_CACHE_TIME }
 
     this.#rcMap = RcMap.make({
@@ -86,10 +88,10 @@ export class StoreRegistry {
           const store = yield* createStore(options).pipe(
             Effect.acquireRelease(() =>
               Effect.gen(this, function* () {
-                this.#promiseCache.delete(options.storeId)
                 this.#optionsByStoreId.delete(options.storeId)
               }),
             ),
+            Effect.catchAllDefect((cause) => UnknownError.make({ cause })),
           )
           return store
         }).pipe(Effect.withSpan(`StoreRegistry.lookup:${options.storeId}`)),
@@ -126,15 +128,20 @@ export class StoreRegistry {
   getOrLoadStore = <TSchema extends LiveStoreSchema>(
     options: CachedStoreOptions<TSchema>,
   ): Store<TSchema> | Promise<Store<TSchema>> => {
-    const cacheKey = this.#getCacheKey(options)
-    const cachedResult = this.#promiseCache.getResult<TSchema>(cacheKey.storeId)
+    const exit = this.getOrLoad<TSchema>(options).pipe(Effect.scoped, Runtime.runSyncExit(this.#runtime))
 
-    if (cachedResult?.status === 'fulfilled') return cachedResult.value
-    if (cachedResult?.status === 'rejected') throw cachedResult.reason
+    if (Exit.isSuccess(exit)) return exit.value as Store<TSchema>
 
-    return this.#promiseCache.getOrLoad(cacheKey, (opts) =>
-      this.getOrLoad<TSchema>(opts).pipe(Effect.provide(this.#runtime), Effect.runPromise),
-    )
+    // Check if the failure is due to async work
+    const defect = Cause.dieOption(exit.cause)
+    if (defect._tag === 'Some' && Runtime.isAsyncFiberException(defect.value)) {
+      // Use the already-running fiber from the exception
+      const fiber = defect.value.fiber
+      return Fiber.join(fiber).pipe(Effect.runPromise) as Promise<Store<TSchema>>
+    }
+
+    // Handle synchronous failure
+    throw Cause.squash(exit.cause)
   }
 
   /** Retain the store while mounted; caller releases via the returned unsubscribe. */
@@ -155,7 +162,10 @@ export class StoreRegistry {
       () => undefined,
     )
 
-  /** Canonicalize caller options for RcMap keying and memoized promise cache. */
+  /**
+   * Canonicalize caller options for RcMap keying and memoized promise cache.
+   * Only used for improved error messages when user passes different options to the same store.
+   */
   #getCacheKey = <TSchema extends LiveStoreSchema>(
     options: CachedStoreOptions<TSchema>,
   ): CachedStoreOptions<TSchema> => {
@@ -176,56 +186,5 @@ export class StoreRegistry {
 
     this.#optionsByStoreId.set(options.storeId, canonical)
     return canonical
-  }
-}
-
-type StoreResult<TSchema extends LiveStoreSchema> =
-  | { status: 'fulfilled'; value: Store<TSchema> }
-  | { status: 'rejected'; reason: unknown }
-
-/**
- * Lightweight cache to keep one in-flight/settled promise per storeId and expose
- * settled results for React suspense reuse without entangling StoreRegistry with
- * promise status tagging.
- */
-class StorePromiseCache {
-  /** In-flight or settled promises per storeId. */
-  #storePromises = new Map<StoreId, Promise<Store<any>>>()
-  /** Tracks settled results so React can reuse status synchronously in useStore. */
-  #storeResults = new Map<StoreId, StoreResult<any>>()
-
-  getOrLoad = <TSchema extends LiveStoreSchema>(
-    options: CachedStoreOptions<TSchema>,
-    loader: (opts: CachedStoreOptions<TSchema>) => Promise<Store<TSchema>>,
-  ): Promise<Store<TSchema>> => {
-    /** Only one promise per storeId; reuse across callers to avoid duplicate loads. */
-    const existing = this.#storePromises.get(options.storeId) as Promise<Store<TSchema>> | undefined
-    if (existing) return existing
-
-    /**
-     * Capture settled result so React.use can reuse fulfilled/rejected values
-     * without re-awaiting (status tagging happens in useStore).
-     */
-    const promise = loader(options).then(
-      (value) => {
-        this.#storeResults.set(options.storeId, { status: 'fulfilled', value })
-        return value
-      },
-      (reason) => {
-        this.#storeResults.set(options.storeId, { status: 'rejected', reason })
-        throw reason
-      },
-    )
-
-    this.#storePromises.set(options.storeId, promise)
-    return promise
-  }
-
-  getResult = <TSchema extends LiveStoreSchema>(storeId: StoreId): StoreResult<TSchema> | undefined =>
-    this.#storeResults.get(storeId) as StoreResult<TSchema> | undefined
-
-  delete = (storeId: StoreId): void => {
-    this.#storePromises.delete(storeId)
-    this.#storeResults.delete(storeId)
   }
 }

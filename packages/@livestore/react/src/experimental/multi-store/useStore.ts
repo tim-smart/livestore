@@ -17,11 +17,11 @@ export const useStore = <TSchema extends LiveStoreSchema>(
   const storeRegistry = useStoreRegistry()
 
   const subscribe = React.useCallback(
-    (onChange: () => void) => storeRegistry.subscribe(options.storeId, onChange),
-    [storeRegistry, options.storeId],
+    (onChange: () => void) => storeRegistry.subscribe(options, onChange),
+    [storeRegistry, options],
   )
   const getSnapshot = React.useCallback(() => {
-    const storeOrPromise = storeRegistry.getOrLoad(options)
+    const storeOrPromise = storeRegistry.getOrLoadPromise(options)
 
     if (storeOrPromise instanceof Promise) throw storeOrPromise
 

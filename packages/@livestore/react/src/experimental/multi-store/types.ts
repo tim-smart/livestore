@@ -1,7 +1,6 @@
 import type { Adapter } from '@livestore/common'
 import type { LiveStoreSchema } from '@livestore/common/schema'
 import type { CreateStoreOptions, OtelOptions } from '@livestore/livestore'
-import type { OtelTracer, Runtime, Scope } from '@livestore/utils/effect'
 
 export type StoreId = string
 
@@ -52,7 +51,6 @@ export type CachedStoreOptions<
      * @defaultValue `60_000` (60 seconds) or `Infinity` during SSR to avoid
      * disposing stores before server render completes.
      */
+    // TODO document sublety about using the last passed value to the registry (see StoreRegistry.ts)
     unusedCacheTime?: number
-    // todo jsdoc
-    runtime?: Runtime.Runtime<Scope.Scope | OtelTracer.OtelTracer>
   }

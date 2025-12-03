@@ -160,6 +160,8 @@ type DefaultStoreOptions = Partial<
    * disposing stores before server render completes.
    */
   unusedCacheTime?: number
+  // todo jsdoc
+  runtime?: Runtime.Runtime<Scope.Scope | OtelTracer.OtelTracer>
 }
 
 /**
@@ -168,17 +170,32 @@ type DefaultStoreOptions = Partial<
  * @public
  */
 export class StoreRegistry {
-  #rcMap: RcMap.RcMap<StoreId, { store: Store<LiveStoreSchema>; onShutdown: Set<() => void> }, UnknownError>
+  #rcMap: RcMap.RcMap<
+    CachedStoreOptions<any>,
+    {
+      store: Store<LiveStoreSchema>
+      /** Set of subscriber callbacks to notify when the store is shut down. */
+      onShutdown: Set<() => void>
+    },
+    UnknownError
+  >
   #runtime: Runtime.Runtime<Scope.Scope | OtelTracer.OtelTracer>
 
-  constructor(options: CachedStoreOptions) {
+  constructor(defaultOptions?: DefaultStoreOptions) {
     this.#runtime =
-      options.runtime ??
+      defaultOptions?.runtime ??
       ManagedRuntime.make(Layer.mergeAll(Layer.scope, OtelLiveDummy)).runtimeEffect.pipe(Effect.runSync)
 
+    /** We're overriding the idleTimeToLive value with the most recent value passed to the registry. */
+    const idleTimeToLiveRef = { current: defaultOptions?.unusedCacheTime ?? DEFAULT_UNUSED_CACHE_TIME }
+
     this.#rcMap = RcMap.make({
-      lookup: (_storeId: StoreId) =>
+      lookup: (options: CachedStoreOptions) =>
         Effect.gen(this, function* () {
+          if (options.unusedCacheTime !== undefined) {
+            idleTimeToLiveRef.current = options.unusedCacheTime
+          }
+
           const onShutdown = new Set<() => void>()
           const store = yield* createStore(options).pipe(
             Effect.acquireRelease(() =>
@@ -189,9 +206,9 @@ export class StoreRegistry {
               }),
             ),
           )
-          return { store, onShutdown: new Set<() => void>() }
+          return { store, onShutdown }
         }),
-      idleTimeToLive: options.unusedCacheTime ?? DEFAULT_UNUSED_CACHE_TIME,
+      idleTimeToLive: idleTimeToLiveRef.current,
     }).pipe(Effect.provide(this.#runtime), Effect.runSync)
   }
 
@@ -208,10 +225,10 @@ export class StoreRegistry {
    * - Applies default options from registry config, with call-site options taking precedence
    */
   getOrLoad = <TSchema extends LiveStoreSchema>(
-    storeId: StoreId,
+    options: CachedStoreOptions<TSchema>,
   ): Effect.Effect<Store<TSchema>, UnknownError, Scope.Scope> =>
     Effect.gen(this, function* () {
-      const storeEntry = yield* RcMap.get(this.#rcMap, storeId)
+      const storeEntry = yield* RcMap.get(this.#rcMap, options)
 
       return storeEntry.store as unknown as Store<TSchema>
     })
@@ -228,12 +245,12 @@ export class StoreRegistry {
    * - Returns a stable Promise reference when loading is in progress or needs to be initiated
    * - Applies default options from registry config, with call-site options taking precedence
    */
-  getOrLoadPromise = <TSchema extends LiveStoreSchema>(storeId: StoreId): Promise<Store<TSchema>> =>
-    this.getOrLoad<TSchema>(storeId).pipe(Effect.provide(this.#runtime), Effect.runPromise)
+  getOrLoadPromise = <TSchema extends LiveStoreSchema>(options: CachedStoreOptions<TSchema>): Promise<Store<TSchema>> =>
+    this.getOrLoad<TSchema>(options).pipe(Effect.provide(this.#runtime), Effect.runPromise)
 
-  subscribe = (storeId: StoreId, listener: () => void): Unsubscribe => {
+  subscribe = (options: CachedStoreOptions<any>, listener: () => void): Unsubscribe => {
     const unsubscribe = Effect.gen(this, function* () {
-      const entry = yield* RcMap.get(this.#rcMap, storeId)
+      const entry = yield* RcMap.get(this.#rcMap, options)
 
       entry.onShutdown.add(listener)
 
@@ -242,4 +259,9 @@ export class StoreRegistry {
 
     return () => unsubscribe()
   }
+
+  preload = (options: CachedStoreOptions<any>): Promise<void> =>
+    this.getOrLoadPromise(options)
+      .then(() => undefined)
+      .catch(() => undefined)
 }

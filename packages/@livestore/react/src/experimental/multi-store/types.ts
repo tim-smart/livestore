@@ -31,7 +31,7 @@ export type CachedStoreOptions<
 > = StoreDescriptor<TSchema> &
   Pick<
     CreateStoreOptions<TSchema, TContext>,
-    'boot' | 'batchUpdates' | 'disableDevtools' | 'confirmUnsavedChanges' | 'syncPayload' | 'debug'
+    'boot' | 'batchUpdates' | 'disableDevtools' | 'confirmUnsavedChanges' | 'syncPayload' | 'debug' | 'shutdownDeferred'
   > & {
     signal?: AbortSignal
     otelOptions?: Partial<OtelOptions>

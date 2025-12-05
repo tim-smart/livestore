@@ -1,631 +1,255 @@
 import { makeInMemoryAdapter } from '@livestore/adapter-web'
-import { StoreInternalsSymbol } from '@livestore/livestore'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { makeShutdownDeferred, StoreInternalsSymbol } from '@livestore/livestore'
+import { Deferred, Effect, Exit, type OtelTracer, Scope } from '@livestore/utils/effect'
+import { Vitest } from '@livestore/utils-dev/node-vitest'
 import { schema } from '../../__tests__/fixture.tsx'
-import { DEFAULT_UNUSED_CACHE_TIME, StoreRegistry } from './StoreRegistry.ts'
+import { StoreRegistry } from './StoreRegistry.ts'
 import { storeOptions } from './storeOptions.ts'
 import type { CachedStoreOptions } from './types.ts'
 
-describe('StoreRegistry', () => {
-  afterEach(() => {
-    vi.clearAllTimers()
-    vi.useRealTimers()
-  })
+const testStoreId = 'test-store'
 
-  it('returns a Promise when the store is loading', async () => {
-    const registry = new StoreRegistry()
-    const result = registry.getOrLoad(testStoreOptions())
-
-    expect(result).toBeInstanceOf(Promise)
-
-    // Clean up
-    const store = await result
-    await store.shutdownPromise()
-  })
-
-  it('returns cached store synchronously after first load resolves', async () => {
-    const registry = new StoreRegistry()
-
-    const initial = registry.getOrLoad(testStoreOptions())
-    expect(initial).toBeInstanceOf(Promise)
-
-    const store = await initial
-
-    const cached = registry.getOrLoad(testStoreOptions())
-    expect(cached).toBe(store)
-    expect(cached).not.toBeInstanceOf(Promise)
-
-    // Clean up
-    await store.shutdownPromise()
-  })
-
-  it('reuses the same promise for concurrent getOrLoad calls while loading', async () => {
-    const registry = new StoreRegistry()
-    const options = testStoreOptions()
-
-    const first = registry.getOrLoad(options)
-    const second = registry.getOrLoad(options)
-
-    // Both should be the same promise
-    expect(first).toBe(second)
-    expect(first).toBeInstanceOf(Promise)
-
-    const store = await first
-
-    // Both promises should resolve to the same store
-    expect(await second).toBe(store)
-
-    // Clean up
-    await store.shutdownPromise()
-  })
-
-  it('stores and rethrows the rejection on subsequent getOrLoad calls after a failure', async () => {
-    const registry = new StoreRegistry()
-
-    // Create an invalid adapter that will cause an error
-    const badOptions = testStoreOptions({
-      // @ts-expect-error - intentionally passing invalid adapter to trigger error
-      adapter: null,
-    })
-
-    await expect(registry.getOrLoad(badOptions)).rejects.toThrow()
-
-    // Subsequent call should throw the cached error synchronously
-    expect(() => registry.getOrLoad(badOptions)).toThrow()
-  })
-
-  it('disposes store after unusedCacheTime expires', async () => {
-    vi.useFakeTimers()
-    const registry = new StoreRegistry()
-    const unusedCacheTime = 25
-    const options = testStoreOptions({ unusedCacheTime })
-
-    const store = await registry.getOrLoad(options)
-
-    // Store should be cached
-    expect(registry.getOrLoad(options)).toBe(store)
-
-    // Advance time to trigger disposal
-    await vi.advanceTimersByTimeAsync(unusedCacheTime)
-
-    // After disposal, store should be removed
-    // The store is removed from cache, so next getOrLoad creates a new one
-    const nextStore = await registry.getOrLoad(options)
-
-    // Should be a different store instance
-    expect(nextStore).not.toBe(store)
-    expect(nextStore[StoreInternalsSymbol].clientSession.debugInstanceId).toBeDefined()
-
-    // Clean up the second store (first one was disposed)
-    await nextStore.shutdownPromise()
-  })
-
-  it('keeps the longest unusedCacheTime seen for a store when options vary across calls', async () => {
-    vi.useFakeTimers()
-    const registry = new StoreRegistry()
-
-    const options = testStoreOptions({ unusedCacheTime: 10 })
-    const unsubscribe = registry.subscribe(options.storeId, () => {})
-
-    const store = await registry.getOrLoad(options)
-
-    // Call with longer unusedCacheTime
-    await registry.getOrLoad(testStoreOptions({ unusedCacheTime: 100 }))
-
-    unsubscribe()
-
-    // After 99ms, store should still be alive (100ms unusedCacheTime used)
-    await vi.advanceTimersByTimeAsync(99)
-
-    // Store should still be cached
-    expect(registry.getOrLoad(options)).toBe(store)
-
-    // After the full 100ms, store should be disposed
-    await vi.advanceTimersByTimeAsync(1)
-
-    // Next getOrLoad should create a new store
-    const nextStore = await registry.getOrLoad(options)
-    expect(nextStore).not.toBe(store)
-
-    // Clean up the second store (first one was disposed)
-    await nextStore.shutdownPromise()
-  })
-
-  it('preload does not throw', async () => {
-    const registry = new StoreRegistry()
-
-    // Create invalid options that would cause an error
-    const badOptions = testStoreOptions({
-      // @ts-expect-error - intentionally passing invalid adapter to trigger error
-      adapter: null,
-    })
-
-    // preload should not throw
-    await expect(registry.preload(badOptions)).resolves.toBeUndefined()
-
-    // But subsequent getOrLoad should throw the cached error
-    expect(() => registry.getOrLoad(badOptions)).toThrow()
-  })
-
-  it('does not dispose when unusedCacheTime is Infinity', async () => {
-    vi.useFakeTimers()
-    const registry = new StoreRegistry()
-    const options = testStoreOptions({ unusedCacheTime: Number.POSITIVE_INFINITY })
-
-    const store = await registry.getOrLoad(options)
-
-    // Store should be cached
-    expect(registry.getOrLoad(options)).toBe(store)
-
-    // Advance time by a very long duration
-    await vi.advanceTimersByTimeAsync(1000000)
-
-    // Store should still be cached (not disposed)
-    expect(registry.getOrLoad(options)).toBe(store)
-
-    // Clean up manually
-    await store.shutdownPromise()
-  })
-
-  it('throws the same error instance on multiple synchronous calls after failure', async () => {
-    const registry = new StoreRegistry()
-
-    const badOptions = testStoreOptions({
-      // @ts-expect-error - intentionally passing invalid adapter to trigger error
-      adapter: null,
-    })
-
-    // Wait for the first failure
-    await expect(registry.getOrLoad(badOptions)).rejects.toThrow()
-
-    // Capture the errors from subsequent synchronous calls
-    let error1: unknown
-    let error2: unknown
-
-    try {
-      registry.getOrLoad(badOptions)
-    } catch (err) {
-      error1 = err
-    }
-
-    try {
-      registry.getOrLoad(badOptions)
-    } catch (err) {
-      error2 = err
-    }
-
-    // Both should be the exact same error instance (cached)
-    expect(error1).toBeDefined()
-    expect(error1).toBe(error2)
-  })
-
-  it('notifies subscribers when store state changes', async () => {
-    const registry = new StoreRegistry()
-    const options = testStoreOptions()
-
-    let notificationCount = 0
-    const listener = () => {
-      notificationCount++
-    }
-
-    const unsubscribe = registry.subscribe(options.storeId, listener)
-
-    // Start loading the store
-    const storePromise = registry.getOrLoad(options)
-
-    // Listener should be called when store starts loading
-    expect(notificationCount).toBe(1)
-
-    const store = await storePromise
-
-    // Listener should be called when store loads successfully
-    expect(notificationCount).toBe(2)
-
-    unsubscribe()
-
-    // Clean up
-    await store.shutdownPromise()
-  })
-
-  it('handles rapid subscribe/unsubscribe cycles without errors', async () => {
-    vi.useFakeTimers()
-    const registry = new StoreRegistry()
-    const unusedCacheTime = 50
-    const options = testStoreOptions({ unusedCacheTime })
-
-    const store = await registry.getOrLoad(options)
-
-    // Rapidly subscribe and unsubscribe multiple times
-    for (let i = 0; i < 10; i++) {
-      const unsubscribe = registry.subscribe(options.storeId, () => {})
-      unsubscribe()
-    }
-
-    // Advance time to check if disposal is scheduled correctly
-    await vi.advanceTimersByTimeAsync(unusedCacheTime)
-
-    // Store should be disposed after the last unsubscribe
-    const nextStore = await registry.getOrLoad(options)
-    expect(nextStore).not.toBe(store)
-
-    await nextStore.shutdownPromise()
-  })
-
-  it('swallows errors thrown by subscribers during notification', async () => {
-    const registry = new StoreRegistry()
-    const options = testStoreOptions()
-
-    let errorListenerCalled = false
-    let goodListenerCalled = false
-
-    const errorListener = () => {
-      errorListenerCalled = true
-      throw new Error('Listener error')
-    }
-
-    const goodListener = () => {
-      goodListenerCalled = true
-    }
-
-    registry.subscribe(options.storeId, errorListener)
-    registry.subscribe(options.storeId, goodListener)
-
-    // Should not throw despite errorListener throwing
-    const store = await registry.getOrLoad(options)
-
-    // Both listeners should have been called
-    expect(errorListenerCalled).toBe(true)
-    expect(goodListenerCalled).toBe(true)
-
-    await store.shutdownPromise()
-  })
-
-  it('supports concurrent load and subscribe operations', async () => {
-    const registry = new StoreRegistry()
-    const options = testStoreOptions()
-
-    let notificationCount = 0
-    const listener = () => {
-      notificationCount++
-    }
-
-    // Subscribe before loading starts
-    const unsubscribe = registry.subscribe(options.storeId, listener)
-
-    // Start loading
-    const storePromise = registry.getOrLoad(options)
-
-    // Listener should be notified when loading starts
-    expect(notificationCount).toBeGreaterThan(0)
-
-    const store = await storePromise
-
-    // Listener should be notified when loading completes
-    expect(notificationCount).toBe(2)
-
-    unsubscribe()
-
-    // Clean up
-    await store.shutdownPromise()
-  })
-
-  it('cancels disposal when a new subscription is added', async () => {
-    vi.useFakeTimers()
-    const registry = new StoreRegistry()
-    const unusedCacheTime = 50
-    const options = testStoreOptions({ unusedCacheTime })
-
-    const store = await registry.getOrLoad(options)
-
-    // Advance time almost to disposal threshold
-    await vi.advanceTimersByTimeAsync(unusedCacheTime - 5)
-
-    // Add a new subscription before disposal triggers
-    const unsubscribe = registry.subscribe(options.storeId, () => {})
-
-    // Complete the original unusedCacheTime
-    await vi.advanceTimersByTimeAsync(5)
-
-    // Store should not have been disposed because we added a subscription
-    expect(registry.getOrLoad(options)).toBe(store)
-
-    // Clean up
-    unsubscribe()
-    await vi.advanceTimersByTimeAsync(unusedCacheTime)
-
-    // Now it should be disposed
-    const nextStore = await registry.getOrLoad(options)
-    expect(nextStore).not.toBe(store)
-
-    await nextStore.shutdownPromise()
-  })
-
-  it('schedules disposal if store becomes unused during loading', async () => {
-    vi.useFakeTimers()
-    const registry = new StoreRegistry()
-    const unusedCacheTime = 50
-    const options = testStoreOptions({ unusedCacheTime })
-
-    // Start loading without any subscription
-    const storePromise = registry.getOrLoad(options)
-
-    // Wait for store to load (no subscribers registered)
-    const store = await storePromise
-
-    // Since there were no subscribers when loading completed, disposal should be scheduled
-    await vi.advanceTimersByTimeAsync(unusedCacheTime)
-
-    // Store should be disposed
-    const nextStore = await registry.getOrLoad(options)
-    expect(nextStore).not.toBe(store)
-
-    await nextStore.shutdownPromise()
-  })
-
-  it('aborts loading when disposal fires while store is still loading', async () => {
-    vi.useFakeTimers()
-    const registry = new StoreRegistry()
-    const unusedCacheTime = 10
-    const options = testStoreOptions({ unusedCacheTime })
-
-    // Subscribe briefly to trigger getOrLoad and then unsubscribe
-    const unsubscribe = registry.subscribe(options.storeId, () => {})
-
-    // Start loading - this will be slow due to fake timers
-    const loadPromise = registry.getOrLoad(options)
-
-    // Attach a catch handler to prevent unhandled rejection when the load is aborted
-    const abortedPromise = (loadPromise as Promise<unknown>).catch(() => {
-      // Expected: load was aborted by disposal
-    })
-
-    // Unsubscribe immediately, which schedules disposal
-    unsubscribe()
-
-    // Advance time to trigger disposal while still loading
-    await vi.advanceTimersByTimeAsync(unusedCacheTime)
-
-    // Wait for the abort to complete
-    await abortedPromise
-
-    // After abort, a new getOrLoad should start a fresh load
-    const freshLoadPromise = registry.getOrLoad(options)
-
-    // This should be a new promise (not the aborted one)
-    expect(freshLoadPromise).toBeInstanceOf(Promise)
-    expect(freshLoadPromise).not.toBe(loadPromise)
-
-    // Wait for fresh load to complete
-    const store = await freshLoadPromise
-    expect(store).toBeDefined()
-
-    await store.shutdownPromise()
-  })
-
-  it('does not abort loading when new subscription arrives before disposal fires', async () => {
-    vi.useFakeTimers()
-    const registry = new StoreRegistry()
-    const unusedCacheTime = 50
-    const options = testStoreOptions({ unusedCacheTime })
-
-    // Start loading and immediately unsubscribe to schedule disposal
-    const unsub1 = registry.subscribe(options.storeId, () => {})
-    const loadPromise = registry.getOrLoad(options)
-    unsub1()
-
-    // Advance time partially (before disposal fires)
-    await vi.advanceTimersByTimeAsync(unusedCacheTime - 10)
-
-    // Add a new subscription - this should cancel the pending disposal
-    const unsub2 = registry.subscribe(options.storeId, () => {})
-
-    // Advance past the original unusedCacheTime
-    await vi.advanceTimersByTimeAsync(20)
-
-    // The load should complete normally (not be aborted)
-    const store = await loadPromise
-
-    // And should be the same instance when retrieved again
-    const cachedStore = registry.getOrLoad(options)
-    expect(cachedStore).toBe(store)
-
-    unsub2()
-    await store.shutdownPromise()
-  })
-
-  it('manages multiple stores with different IDs independently', async () => {
-    vi.useFakeTimers()
-    const registry = new StoreRegistry()
-
-    const options1 = testStoreOptions({ storeId: 'store-1', unusedCacheTime: 50 })
-    const options2 = testStoreOptions({ storeId: 'store-2', unusedCacheTime: 100 })
-
-    const store1 = await registry.getOrLoad(options1)
-    const store2 = await registry.getOrLoad(options2)
-
-    // Should be different store instances
-    expect(store1).not.toBe(store2)
-
-    // Both should be cached independently
-    expect(registry.getOrLoad(options1)).toBe(store1)
-    expect(registry.getOrLoad(options2)).toBe(store2)
-
-    // Advance time to dispose store1 only
-    await vi.advanceTimersByTimeAsync(50)
-
-    // store1 should be disposed, store2 should still be cached
-    const newStore1 = await registry.getOrLoad(options1)
-    expect(newStore1).not.toBe(store1)
-    expect(registry.getOrLoad(options2)).toBe(store2)
-
-    // Subscribe to prevent disposal of newStore1
-    const unsub1 = registry.subscribe(options1.storeId, () => {})
-
-    // Advance remaining time to dispose store2
-    await vi.advanceTimersByTimeAsync(50)
-
-    // store2 should be disposed
-    const newStore2 = await registry.getOrLoad(options2)
-    expect(newStore2).not.toBe(store2)
-
-    // Subscribe to prevent disposal of newStore2
-    const unsub2 = registry.subscribe(options2.storeId, () => {})
-
-    // Clean up
-    unsub1()
-    unsub2()
-    await newStore1.shutdownPromise()
-    await newStore2.shutdownPromise()
-  })
-
-  it('applies default options from constructor', async () => {
-    vi.useFakeTimers()
-
-    const registry = new StoreRegistry({
-      defaultOptions: {
-        unusedCacheTime: DEFAULT_UNUSED_CACHE_TIME * 2,
-      },
-    })
-
-    const options = testStoreOptions()
-
-    const store = await registry.getOrLoad(options)
-
-    // Verify the store loads successfully
-    expect(store).toBeDefined()
-    expect(store[StoreInternalsSymbol].clientSession.debugInstanceId).toBeDefined()
-
-    // Verify configured default unusedCacheTime is applied by checking disposal doesn't happen at library's default time
-    await vi.advanceTimersByTimeAsync(DEFAULT_UNUSED_CACHE_TIME)
-
-    // Store should still be cached after default unusedCacheTime
-    expect(registry.getOrLoad(options)).toBe(store)
-
-    await store.shutdownPromise()
-  })
-
-  it('allows call-site options to override default options', async () => {
-    vi.useFakeTimers()
-
-    const registry = new StoreRegistry({
-      defaultOptions: {
-        unusedCacheTime: 1000, // Default is long
-      },
-    })
-
-    const options = testStoreOptions({
-      unusedCacheTime: 10, // Override with shorter time
-    })
-
-    const store = await registry.getOrLoad(options)
-
-    // Advance by the override time (10ms)
-    await vi.advanceTimersByTimeAsync(10)
-
-    // Should be disposed according to the override time, not default
-    const nextStore = await registry.getOrLoad(options)
-    expect(nextStore).not.toBe(store)
-
-    await nextStore.shutdownPromise()
-  })
-
-  it('prevents subscriptions to stores that are shutting down', async () => {
-    vi.useFakeTimers()
-    const registry = new StoreRegistry()
-    const unusedCacheTime = 10
-    const options = testStoreOptions({ unusedCacheTime })
-
-    // Load the store and wait for it to be ready
-    const originalStore = await registry.getOrLoad(options)
-
-    // Verify store is cached
-    expect(registry.getOrLoad(options)).toBe(originalStore)
-
-    // Spy on shutdownPromise to detect when shutdown starts
-    let shutdownStarted = false
-    let shutdownCompleted = false
-    const originalShutdownPromise = originalStore.shutdownPromise.bind(originalStore)
-    originalStore.shutdownPromise = () => {
-      shutdownStarted = true
-      return originalShutdownPromise().finally(() => {
-        shutdownCompleted = true
-      })
-    }
-
-    // Use vi.advanceTimersToNextTimer to advance ONLY to the disposal timer firing,
-    // then immediately (before microtasks resolve) try to get the store
-    vi.advanceTimersToNextTimer()
-
-    // The disposal callback has now executed synchronously, which means:
-    // 1. Subscriber check passed (no subscribers)
-    // 2. shutdown() was called (but it's async, hasn't resolved yet)
-    // 3. Cache entry SHOULD have been removed
-
-    // Verify shutdown was initiated
-    expect(shutdownStarted).toBe(true)
-    // Shutdown is async, so it shouldn't have completed yet in the same tick
-    expect(shutdownCompleted).toBe(false)
-
-    const storeOrPromise = registry.getOrLoad(options)
-
-    if (!(storeOrPromise instanceof Promise)) {
-      expect.fail('getOrLoad returned dying store synchronously instead of starting fresh load')
-    }
-
-    const freshStore = await storeOrPromise
-    // A fresh load was triggered because cache was cleared
-    expect(freshStore).not.toBe(originalStore)
-    await freshStore.shutdownPromise()
-  })
-
-  it('warms the cache so subsequent getOrLoad is synchronous after preload', async () => {
-    const registry = new StoreRegistry()
-    const options = testStoreOptions()
-
-    // Preload the store
-    await registry.preload(options)
-
-    // Subsequent getOrLoad should return synchronously (not a Promise)
-    const store = registry.getOrLoad(options)
-    expect(store).not.toBeInstanceOf(Promise)
-
-    // TypeScript doesn't narrow the type, so we need to assert
-    if (store instanceof Promise) {
-      throw new Error('Expected store, got Promise')
-    }
-
-    // Clean up
-    await store.shutdownPromise()
-  })
-
-  it('schedules disposal after preload if no subscribers are added', async () => {
-    vi.useFakeTimers()
-    const registry = new StoreRegistry()
-    const unusedCacheTime = 50
-    const options = testStoreOptions({ unusedCacheTime })
-
-    // Preload without subscribing
-    await registry.preload(options)
-
-    // Get the store
-    const store = registry.getOrLoad(options)
-    expect(store).not.toBeInstanceOf(Promise)
-
-    // Advance time to trigger disposal
-    await vi.advanceTimersByTimeAsync(unusedCacheTime)
-
-    // Store should be disposed since no subscribers were added
-    const nextStore = await registry.getOrLoad(options)
-    expect(nextStore).not.toBe(store)
-
-    await nextStore.shutdownPromise()
-  })
-})
+const sharedAdapter = makeInMemoryAdapter()
 
 const testStoreOptions = (overrides: Partial<CachedStoreOptions<typeof schema>> = {}) =>
   storeOptions({
-    storeId: 'test-store',
+    storeId: testStoreId,
     schema,
-    adapter: makeInMemoryAdapter(),
+    adapter: sharedAdapter,
+    disableDevtools: true,
     ...overrides,
   })
+
+const makeRegistry = (options: { unusedCacheTime?: number } = {}) =>
+  Effect.gen(function* () {
+    const runtime = yield* Effect.runtime<Scope.Scope | OtelTracer.OtelTracer>()
+    return new StoreRegistry({ defaultOptions: { unusedCacheTime: 10, ...options, runtime } })
+  })
+
+Vitest.describe('StoreRegistry', { timeout: 60_000 }, () => {
+  // TODO: replace Vitest fake timers with Effect TestClock for deterministic time control
+  const withTest = Vitest.makeWithTestCtx({ timeout: 60_000 })
+
+  Vitest.scopedLive('returns a Promise when the store is loading', (test) =>
+    Effect.gen(function* () {
+      const registry = yield* makeRegistry()
+      const shutdownDeferred = yield* makeShutdownDeferred
+      const optionsWithShutdown = testStoreOptions({ shutdownDeferred })
+
+      const result = registry.getOrLoadStore(optionsWithShutdown)
+      Vitest.expect(result).toBeInstanceOf(Promise)
+
+      const store = yield* Effect.promise(async () => result)
+      Vitest.expect(store[StoreInternalsSymbol].clientSession.debugInstanceId).toBeDefined()
+      yield* Effect.promise(() => store.shutdownPromise().catch(() => undefined))
+      yield* Deferred.await(shutdownDeferred)
+    }).pipe(withTest(test)),
+  )
+
+  Vitest.scopedLive('returns the same store for repeated loads', (test) =>
+    Effect.gen(function* () {
+      const registry = yield* makeRegistry()
+      const options = testStoreOptions()
+
+      const store = yield* registry.getOrLoad(options)
+      const cached = yield* registry.getOrLoad(options)
+
+      Vitest.expect(cached).toBe(store)
+      yield* Effect.promise(() => store.shutdownPromise().catch(() => undefined))
+    }).pipe(withTest(test)),
+  )
+
+  Vitest.scopedLive('reuses the same promise for concurrent loads', (test) =>
+    Effect.gen(function* () {
+      const registry = yield* makeRegistry()
+      const options = testStoreOptions()
+
+      // This guards the contract: concurrent callers must see the same in-flight promise
+      // (no duplicate fibers/adapter bootstraps), and after resolution both promises yield
+      // the same store instance.
+      const first = registry.getOrLoadStore(options)
+      const second = registry.getOrLoadStore(options)
+
+      Vitest.expect(second).toBe(first)
+
+      const [storeA, storeB] = yield* Effect.all(
+        [Effect.promise(async () => first), Effect.promise(async () => second)],
+        {
+          concurrency: 'unbounded',
+        },
+      )
+
+      Vitest.expect(storeA).toBe(storeB)
+      yield* Effect.promise(() => storeA.shutdownPromise().catch(() => undefined))
+    }).pipe(withTest(test)),
+  )
+
+  Vitest.scopedLive('reuses the same store across concurrent loads', (test) =>
+    Effect.gen(function* () {
+      const registry = yield* makeRegistry()
+      const options = testStoreOptions()
+
+      const scope = yield* Scope.make()
+      const [storeA, storeB] = yield* Effect.all([registry.getOrLoad(options), registry.getOrLoad(options)], {
+        concurrency: 'unbounded',
+      }).pipe(Scope.extend(scope))
+
+      Vitest.expect(storeA).toBe(storeB)
+
+      yield* Scope.close(scope, Exit.void)
+    }).pipe(withTest(test)),
+  )
+
+  Vitest.scopedLive('creates a fresh store after the idle cache window closes', (test) =>
+    Effect.gen(function* () {
+      const registry = yield* makeRegistry({ unusedCacheTime: 5 })
+      const options = testStoreOptions()
+
+      const scope = yield* Scope.make()
+      const initial = yield* registry.getOrLoad(options).pipe(Scope.extend(scope))
+
+      yield* Scope.close(scope, Exit.void)
+      yield* Effect.sleep(10)
+
+      const next = yield* registry.getOrLoad(options)
+
+      Vitest.expect(next).not.toBe(initial)
+      yield* Effect.promise(() => next.shutdownPromise().catch(() => undefined))
+    }).pipe(withTest(test)),
+  )
+
+  Vitest.scopedLive('does not dispose when unusedCacheTime is Infinity', (test) =>
+    Effect.gen(function* () {
+      const registry = yield* makeRegistry({ unusedCacheTime: Number.POSITIVE_INFINITY })
+      const options = testStoreOptions()
+
+      const store = yield* registry.getOrLoad(options)
+
+      yield* Effect.sleep(10)
+
+      const cached = yield* registry.getOrLoad(options)
+      Vitest.expect(cached).toBe(store)
+      yield* Effect.promise(() => cached.shutdownPromise().catch(() => undefined))
+    }).pipe(withTest(test)),
+  )
+
+  Vitest.scopedLive('applies call-site unusedCacheTime override', (test) =>
+    Effect.gen(function* () {
+      const registry = yield* makeRegistry({ unusedCacheTime: 1_000 })
+      const options = testStoreOptions({ unusedCacheTime: 10 })
+
+      const store = yield* registry.getOrLoad(options)
+      yield* Effect.sleep(10)
+
+      const next = yield* registry.getOrLoad(options)
+      Vitest.expect(next).not.toBe(store)
+      yield* Effect.promise(() => next.shutdownPromise().catch(() => undefined))
+    }).pipe(withTest(test)),
+  )
+
+  Vitest.scopedLive('applies constructor defaults when no override is provided', (test) =>
+    Effect.gen(function* () {
+      const registry = yield* makeRegistry({ unusedCacheTime: 100 })
+      const options = testStoreOptions()
+
+      const store = yield* registry.getOrLoad(options)
+      yield* Effect.sleep(50)
+
+      const cached = yield* registry.getOrLoad(options)
+      Vitest.expect(cached).toBe(store)
+      yield* Effect.promise(() => cached.shutdownPromise().catch(() => undefined))
+    }).pipe(withTest(test)),
+  )
+
+  Vitest.scopedLive('preload warms the cache', (test) =>
+    Effect.gen(function* () {
+      const registry = yield* makeRegistry({ unusedCacheTime: 50 })
+      const options = testStoreOptions()
+
+      yield* Effect.promise(() => registry.preload(options))
+
+      const store = yield* registry.getOrLoad(options)
+      const cached = yield* registry.getOrLoad(options)
+
+      Vitest.expect(cached).toBe(store)
+      yield* Effect.promise(() => cached.shutdownPromise().catch(() => undefined))
+    }).pipe(withTest(test)),
+  )
+
+  Vitest.scopedLive('disposes after preload when unused', (test) =>
+    Effect.gen(function* () {
+      const unusedCacheTime = 20
+      const registry = yield* makeRegistry({ unusedCacheTime })
+      const options = testStoreOptions()
+
+      yield* Effect.promise(() => registry.preload(options))
+      const store = yield* registry.getOrLoad(options)
+
+      yield* Effect.sleep(unusedCacheTime + 5)
+
+      const next = yield* registry.getOrLoad(options)
+      Vitest.expect(next).not.toBe(store)
+      yield* Effect.promise(() => next.shutdownPromise().catch(() => undefined))
+    }).pipe(withTest(test)),
+  )
+
+  Vitest.scopedLive('surfaces cached errors across calls', (test) =>
+    Effect.gen(function* () {
+      const registry = yield* makeRegistry({ unusedCacheTime: 10 })
+      const failingAdapter = (): any => Effect.fail(new Error('boom'))
+      const badOptions = testStoreOptions({ adapter: failingAdapter as any })
+
+      const first = yield* Effect.either(Effect.promise(async () => registry.getOrLoadStore(badOptions)))
+      Vitest.expect(first._tag).toBe('Left')
+
+      const second = yield* Effect.either(Effect.promise(async () => registry.getOrLoadStore(badOptions)))
+      Vitest.expect(second._tag).toBe('Left')
+    }).pipe(withTest(test)),
+  )
+
+  Vitest.scopedLive('allows subscribing and unsubscribing without affecting loads', (test) =>
+    Effect.gen(function* () {
+      const registry = yield* makeRegistry({ unusedCacheTime: 50 })
+      const options = testStoreOptions()
+
+      const unsubscribe = registry.retain(options)
+      const store = yield* registry.getOrLoad(options)
+
+      unsubscribe()
+
+      const cached = yield* registry.getOrLoad(options)
+      Vitest.expect(cached).toBe(store)
+      yield* Effect.promise(() => cached.shutdownPromise().catch(() => undefined))
+    }).pipe(withTest(test)),
+  )
+
+  Vitest.scopedLive('manages multiple stores independently', (test) =>
+    Effect.gen(function* () {
+      const registry = yield* makeRegistry({ unusedCacheTime: 5 })
+      const optsA = testStoreOptions({ storeId: 'store-a' })
+      const optsB = testStoreOptions({ storeId: 'store-b' })
+
+      const scopeA = yield* Scope.make()
+      const scopeB = yield* Scope.make()
+
+      const storeA = yield* registry.getOrLoad(optsA).pipe(Scope.extend(scopeA))
+      const storeB = yield* registry.getOrLoad(optsB).pipe(Scope.extend(scopeB))
+
+      Vitest.expect(storeA).not.toBe(storeB)
+
+      yield* Scope.close(scopeA, Exit.void)
+      yield* Effect.sleep(10)
+
+      // storeA should be gone after idle window; storeB should still be cached
+      const newStoreA = yield* registry.getOrLoad(optsA)
+      const cachedStoreB = yield* registry.getOrLoad(optsB)
+
+      Vitest.expect(newStoreA).not.toBe(storeA)
+      Vitest.expect(cachedStoreB).toBe(storeB)
+
+      yield* Scope.close(scopeB, Exit.void)
+      yield* Effect.promise(() => newStoreA.shutdownPromise().catch(() => undefined))
+      yield* Effect.promise(() => cachedStoreB.shutdownPromise().catch(() => undefined))
+    }).pipe(withTest(test)),
+  )
+})

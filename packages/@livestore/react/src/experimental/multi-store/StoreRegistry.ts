@@ -6,11 +6,11 @@ import {
   Cause,
   Data,
   Effect,
-  Equal,
   Exit,
   Fiber,
   Layer,
   ManagedRuntime,
+  Option,
   type OtelTracer,
   RcMap,
   Runtime,
@@ -65,6 +65,20 @@ export class StoreRegistry {
   #rcMap: RcMap.RcMap<CachedStoreOptions<any>, Store<any>, UnknownError>
   /** Effect runtime to run with current scope and otel tracer. If the scope is closed, all stores will be shut down automatically. */
   #runtime: Runtime.Runtime<Scope.Scope | OtelTracer.OtelTracer>
+  /**
+   * Settled store cache so already-loaded stores return synchronously.
+   * Required to avoid spinning new fibers for repeat callers and to keep
+   * identity stable after the first load completes. Combined with the promise
+   * cache below, this ensures: (1) one in-flight load per key, (2) subsequent
+   * calls after settle return synchronously.
+   */
+  #storeCache = new Map<CachedStoreOptions<any>, Store<any>>()
+  /**
+   * In-flight promise cache to keep identity stable during concurrent loads.
+   * Without this, concurrent callers would fork separate load fibers and could
+   * hang waiting on different adapter bootstraps.
+   */
+  #promiseCache = new Map<CachedStoreOptions<any>, Promise<Store<any>>>()
   /** Canonicalized options per storeId to provide stable RcMap keys. Used for improved error messages when user passes different options to the same store. */
   #optionsByStoreId = new Map<StoreId, CachedStoreOptions<any>>()
 
@@ -86,9 +100,12 @@ export class StoreRegistry {
           }
 
           const store = yield* createStore(options).pipe(
+            Effect.tap((createdStore) => Effect.sync(() => this.#storeCache.set(options, createdStore))),
             Effect.acquireRelease(() =>
               Effect.gen(this, function* () {
                 this.#optionsByStoreId.delete(options.storeId)
+                this.#storeCache.delete(options)
+                this.#promiseCache.delete(options)
               }),
             ),
             Effect.catchAllDefect((cause) => UnknownError.make({ cause })),
@@ -128,20 +145,61 @@ export class StoreRegistry {
   getOrLoadStore = <TSchema extends LiveStoreSchema>(
     options: CachedStoreOptions<TSchema>,
   ): Store<TSchema> | Promise<Store<TSchema>> => {
-    const exit = this.getOrLoad<TSchema>(options).pipe(Effect.scoped, Runtime.runSyncExit(this.#runtime))
-
-    if (Exit.isSuccess(exit)) return exit.value as Store<TSchema>
-
-    // Check if the failure is due to async work
-    const defect = Cause.dieOption(exit.cause)
-    if (defect._tag === 'Some' && Runtime.isAsyncFiberException(defect.value)) {
-      // Use the already-running fiber from the exception
-      const fiber = defect.value.fiber
-      return Fiber.join(fiber).pipe(Effect.runPromise) as Promise<Store<TSchema>>
+    const cacheKey = this.#getCacheKey(options)
+    const cachedStore = this.#storeCache.get(cacheKey) as Store<TSchema> | undefined
+    if (cachedStore !== undefined) {
+      return cachedStore
     }
 
-    // Handle synchronous failure
-    throw Cause.squash(exit.cause)
+    const cachedPromise = this.#promiseCache.get(cacheKey) as Promise<Store<TSchema>> | undefined
+    if (cachedPromise !== undefined) {
+      return cachedPromise
+    }
+
+    const effect = this.getOrLoad<TSchema>(options).pipe(Effect.scoped)
+    /**
+     * Fork on the registry runtime so the fiber survives the calling fiber and
+     * can be polled for a synchronous fast-path. This avoids the
+     * AsyncFiberException path and keeps us in control of the fiber handle.
+     */
+    const fiber = Runtime.runFork(this.#runtime)(effect)
+    const polledExit = Fiber.poll(fiber).pipe(Runtime.runSync(this.#runtime))
+
+    if (Option.isSome(polledExit)) {
+      const exit = polledExit.value
+
+      if (Exit.isSuccess(exit)) {
+        const store = exit.value as Store<TSchema>
+        this.#storeCache.set(cacheKey, store)
+        return store
+      }
+
+      throw Cause.squash(exit.cause)
+    }
+
+    const promise = Fiber.join(fiber)
+      .pipe(
+        Effect.tap((store) => Effect.sync(() => this.#storeCache.set(cacheKey, store as Store<TSchema>))),
+        Effect.runPromise,
+      )
+      .catch((error) => {
+        this.#promiseCache.delete(cacheKey)
+        throw error
+      })
+
+    this.#promiseCache.set(cacheKey, promise)
+
+    promise.then(
+      (store) => {
+        this.#promiseCache.delete(cacheKey)
+        this.#storeCache.set(cacheKey, store)
+      },
+      () => {
+        this.#promiseCache.delete(cacheKey)
+      },
+    )
+
+    return promise
   }
 
   /** Retain the store while mounted; caller releases via the returned unsubscribe. */
